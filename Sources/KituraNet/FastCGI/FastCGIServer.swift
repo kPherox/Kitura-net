@@ -35,6 +35,9 @@ public class FastCGIServer: Server {
     /// Port number for listening for new connections
     public private(set) var port: Int?
 
+    /// Unix socket path for listening for new connections
+    public private(set) var path: String?
+
     /// A server state.
     public private(set) var state: ServerState = .unknown
 
@@ -146,13 +149,57 @@ public class FastCGIServer: Server {
 
     }
 
+    /// Listens for connections on a socket
+    ///
+    /// - Parameter on: unix socket path for new connections
+    public func listen(on path: String) throws {
+        self.path = path
+        do {
+            let socket = try Socket.create(family: .unix)
+            self.listenSocket = socket
+
+            try socket.listen(on: path, maxBacklogSize: maxPendingConnections)
+            Log.info("Listening unix socket \(path)")
+            Log.verbose("Options for unix socket \(path): maxPendingConnections: \(maxPendingConnections)")
+
+            // set synchronously to avoid contention in back to back server start/stop calls
+            self.state = .started
+            self.lifecycleListener.performStartCallbacks()
+
+            let queuedBlock = DispatchWorkItem(block: {
+                self.listen(listenSocket: socket)
+                self.lifecycleListener.performStopCallbacks()
+            })
+
+            ListenerGroup.enqueueAsynchronously(on: DispatchQueue.global(), block: queuedBlock)
+        }
+        catch let error {
+            self.state = .failed
+            self.lifecycleListener.performFailCallbacks(with: error)
+            throw error
+        }
+    }
+
+    /// Static method to create a new `FastCGIServer` and have it listen for conenctions
+    ///
+    /// - Parameter on: unix socket path for new connections
+    /// - Parameter delegate: the delegate handler for FastCGI/HTTP connections
+    ///
+    /// - Returns: a new `FastCGIServer` instance
+    public static func listen(on path: String, delegate: ServerDelegate?) throws -> FastCGIServer {
+        let server = FastCGI.createServer()
+        server.delegate = delegate
+        try server.listen(on: path)
+        return server
+    }
+
     /// Listen on socket while server is started
     private func listen(listenSocket: Socket) {
         repeat {
             do {
                 let clientSocket = try listenSocket.acceptClientConnection()
                 Log.debug("Accepted FastCGI connection from: " +
-                    "\(clientSocket.remoteHostname):\(clientSocket.remotePort)")
+                    (clientSocket.remotePath ?? "\(clientSocket.remoteHostname):\(clientSocket.remotePort)"))
                 handleClientRequest(socket: clientSocket)
             } catch let error {
                 if self.state == .stopped {
